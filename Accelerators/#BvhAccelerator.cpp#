@@ -1,0 +1,233 @@
+// Copyright (c) 2008-2011 Yannick Tapsoba.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
+#include "renderbliss/Accelerators/BvhAccelerator.h"
+#include <algorithm>
+#include <functional>
+#include <boost/array.hpp>
+#include "renderbliss/Macros.h"
+
+namespace
+{
+using namespace renderbliss;
+
+// Splits an array of primitives around the X, Y or Z axis, according
+// to a pivot. Returns the index corresponding to the pivot as a midpoint.
+size_t Split(const PrimitiveList* primitives, std::vector<uint32>& indices, real pivot, unsigned axis)
+{
+    RB_ASSERT(axis < 3);
+
+    struct SplitPredicate : std::unary_function<PrimitiveConstPtr, bool>
+    {
+        real pivot;
+        const PrimitiveList* primitives;
+        unsigned axis;
+
+        SplitPredicate(const PrimitiveList* primitives, real pivot, unsigned axis)
+            : pivot(pivot), primitives(primitives), axis(axis) {}
+
+        bool operator()(uint32 index) const
+        {
+            real centroid = (*primitives)[index]->WorldBound().Center()[axis];
+            return centroid < pivot;
+        }
+    };
+
+    std::vector<uint32>::iterator partitionIter = std::partition(indices.begin(), indices.end(), SplitPredicate(primitives, pivot, axis));
+    return (partitionIter==indices.begin()) || (partitionIter==indices.end()) ? indices.size()/2
+                                                                              : partitionIter-indices.begin();
+}
+}
+
+namespace renderbliss
+{
+struct BvhBuildNode
+{
+
+  
+
+    BoundingBox worldBound;
+    boost::scoped_ptr<BvhBuildNode> leftNode;
+    boost::scoped_ptr<BvhBuildNode> rightNode;
+    uint32 leafIndex; // Set to -1 for interior nodes
+    void Build(const PrimitiveList& primitives, std::vector<uint32>& indices, unsigned splitAxis);
+    void Flatten(std::vector<BvhLinearNode>& linearNodes) const;
+    bool IsLeaf() const { return leafIndex != 0xFFFFFFFF; }
+};
+
+struct BvhLinearNode
+{
+    BoundingBox worldBound;
+    union { uint32 leafIndex, rightChildIndex; };
+    uint32 leaf; // 0 for interior nodes, 1 for leaf nodes; 4-byte integer to ensure cache alignment
+    bool IsLeaf() const { return leaf != 0; }
+};
+
+void BvhBuildNode::Build(const PrimitiveList& primitives, std::vector<uint32>& indices, unsigned splitAxis)
+{
+    if (primitives.empty() || indices.empty()) return;
+
+    leafIndex = 0xFFFFFFFF;
+    leftNode.reset();
+    rightNode.reset();
+    worldBound.Collapse();
+
+    size_t numPrimitives = indices.size();
+    for (size_t i = 0; i < numPrimitives; ++i)
+    {
+        RB_ASSERT(primitives[indices[i]].get());
+        worldBound.Enclose(primitives[indices[i]]->WorldBound());
+    }
+
+    if (numPrimitives == 1) // This is a leaf node
+    {
+        leafIndex = indices[0];
+    }
+    else if (numPrimitives == 2) // The children will be leaves
+    {
+        leftNode.reset(new BvhBuildNode);
+        leftNode->worldBound = primitives[indices[0]]->WorldBound();
+        leftNode->leafIndex = indices[0];
+
+        rightNode.reset(new BvhBuildNode);
+        rightNode->worldBound = primitives[indices[1]]->WorldBound();
+        rightNode->leafIndex = indices[1];
+    }
+    else
+    {
+        Vector3 pivot = worldBound.Center();
+        size_t midpoint = Split(&primitives, indices, pivot[splitAxis], splitAxis);
+
+        std::vector<uint32> leftBranch(indices.begin(), indices.begin()+midpoint);
+        leftNode.reset(new BvhBuildNode);
+        leftNode->Build(primitives, leftBranch, (splitAxis+1)%3);
+
+        std::vector<uint32> rightBranch(indices.begin()+midpoint, indices.end());
+        rightNode.reset(new BvhBuildNode);
+        rightNode->Build(primitives, rightBranch, (splitAxis+1)%3);
+    }
+}
+
+void BvhBuildNode::Flatten(std::vector<BvhLinearNode>& linearNodes) const
+{
+    linearNodes.push_back(BvhLinearNode());
+    size_t currentOffset = linearNodes.size()-1;
+    linearNodes[currentOffset].worldBound = worldBound;
+
+    if (IsLeaf())
+    {
+        linearNodes[currentOffset].leaf = 1;
+        linearNodes[currentOffset].leafIndex = leafIndex;
+    }
+    else
+    {
+        linearNodes[currentOffset].leaf = 0;
+        if (leftNode.get())
+        {
+            leftNode->Flatten(linearNodes);
+        }
+        if (rightNode.get())
+        {
+            uint32 offset = linearNodes.size();
+            rightNode->Flatten(linearNodes);
+            linearNodes[currentOffset].rightChildIndex = offset;
+        }
+    }
+}
+
+BvhAccelerator::BvhAccelerator()
+{
+}
+
+void BvhAccelerator::Build(const PrimitiveList& primitives)
+{
+    this->primitives = primitives;
+    if (!this->primitives.empty())
+    {
+        // Build a temporary bvh tree
+        std::vector<uint32> indices;
+        for (uint32 i = 0; i < this->primitives.size(); ++i)
+        {
+            indices.push_back(i);
+        }
+        boost::scoped_ptr<BvhBuildNode> rootNode(new BvhBuildNode);
+        rootNode->Build(primitives, indices, 0);
+        // Flatten the tree into the linear node array
+        rootNode->Flatten(nodes);
+        // Shrink node array capacity to fit the contained nodes
+        std::vector<BvhLinearNode>(nodes).swap(nodes);
+    }
+}
+
+bool BvhAccelerator::Intersects(const Ray& ray, Intersection& hit) const
+{
+    if (primitives.empty() || nodes.empty())
+    {
+        return false;
+    }
+
+    bool result = false;
+
+    boost::array<uint32, 64> nodeStack;
+    int currentNodeOffset = 0;
+    size_t numNodes = nodes.size();
+    nodeStack[currentNodeOffset] = 0;
+
+    while (currentNodeOffset >= 0)
+    {
+        uint32 currentNodeIndex = nodeStack[currentNodeOffset];
+        --currentNodeOffset;
+        if (currentNodeIndex >= numNodes)
+        {
+            continue;
+        }
+
+        real tEntry, tExit;
+        const BvhLinearNode* currentNode = &nodes[currentNodeIndex];
+        if (!currentNode->worldBound.Intersects(ray, tEntry, tExit))
+        {
+            continue;
+        }
+
+        if (currentNode->IsLeaf())
+        {
+            bool leafHit = primitives[currentNode->leafIndex]->Intersects(ray, hit);
+            if (ray.lookingForShadowHit && leafHit)
+            {
+                return true;
+            }
+            result |= leafHit;
+        }
+        else
+        {
+            // Push right node, then push left node
+            nodeStack[++currentNodeOffset] = currentNode->rightChildIndex;
+            nodeStack[++currentNodeOffset] = currentNodeIndex+1;
+        }
+    }
+
+    return result;
+}
+
+BoundingBox BvhAccelerator::WorldBound() const
+{
+    return nodes.empty() ? BoundingBox() : nodes[0].worldBound;
+}
+}
